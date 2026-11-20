@@ -1,0 +1,59 @@
+# Club Expense Claim Checker
+
+A console-based Python project that extracts claim details using an LLM, verifies key facts against the original note, applies club budget rules, and creates review reports. **It does not make payments.** The faculty treasurer must sign every payment after seeing the bill.
+
+## Project files
+- `main.py` – application and decision rules
+- `claims.csv` – 20 sample claims in date order
+- `budgets.csv` – category limits per club
+- `system_prompt.txt` – five-role prompt (Authority, Exemplar, Constraint, Rubric, Metadata)
+- `.env.example` – environment variable template
+- `.gitignore` – prevents the API key file from being committed
+- `tests/` – starter evaluation and red-team plan
+- `docs/` – specification and written submission templates
+- `outputs/` – generated reports
+
+## Requirements
+- Python 3.10 or later
+- An API endpoint compatible with the OpenAI Chat Completions request/response format
+- API credentials supplied by your Week 12 provider
+
+## Setup
+1. Install Python 3.10+.
+2. Open this folder in VS Code.
+3. Create a virtual environment (optional): `python -m venv .venv`
+4. Activate it:
+   - Windows: `.venv\\Scripts\\activate`
+   - macOS/Linux: `source .venv/bin/activate`
+5. Copy `.env.example` to `.env`.
+6. Fill in `LLM_API_URL`, `LLM_MODEL`, and `LLM_API_KEY` using your approved provider's details. Do not share the key.
+7. Run: `python main.py`
+
+The API endpoint must accept a JSON body containing `model`, `temperature`, and `messages`, and return `choices[0].message.content`. If your Week 12 provider uses a different API format, adapt only the `classify()` function with faculty guidance.
+
+## Output
+The program writes four files inside `outputs/`:
+- `payable.csv`
+- `review.csv`
+- `results.csv`
+- `summary.txt`
+
+Only `ok_to_pay` claims count toward the running budget. A result marked `ok_to_pay` is not a payment instruction.
+
+## Decision order
+1. Validate extracted amount and bill against the note.
+2. No amount → `needs_more_info`.
+3. No bill → `needs_bill`.
+4. Amount above Rs. 5,000, or same club/category/date combined amount above Rs. 5,000 → `needs_approval`.
+5. Spending would exceed category limit → `over_budget`.
+6. Otherwise → `ok_to_pay`.
+
+## Important safety checks
+- Never commit `.env`.
+- Check the LLM response; do not blindly trust it.
+- The amount must appear numerically in the note.
+- Do not count non-payable claims against the budget.
+- The tool only sorts claims; the faculty treasurer is the human checkpoint.
+
+## GitHub
+See `docs/GITHUB_STEPS.md` for beginner-friendly instructions. Before final submission, complete the documentation templates and run your evaluation tests.

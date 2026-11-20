@@ -1,0 +1,220 @@
+"""Club Expense Claim Checker - console application."""
+import csv
+import json
+import os
+import re
+import sys
+import urllib.request
+import urllib.error
+from collections import defaultdict
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+CLAIMS_FILE = BASE_DIR / "claims.csv"
+BUDGETS_FILE = BASE_DIR / "budgets.csv"
+OUTPUT_DIR = BASE_DIR / "outputs"
+SYSTEM_PROMPT_FILE = BASE_DIR / "system_prompt.txt"
+ALLOWED_CATEGORIES = {"printing", "food", "travel", "prizes", "equipment", "costumes", "other"}
+STATUSES = {"ok_to_pay", "needs_bill", "needs_approval", "over_budget", "needs_more_info"}
+
+
+def load_env_file():
+    """Load simple KEY=VALUE entries from .env without requiring an extra package."""
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def numbers_in(note):
+    """Return numeric amounts explicitly written in a claim note."""
+    found = re.findall(r"(?<![A-Za-z])(?:Rs\.?\s*)?(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?", note, re.I)
+    values = []
+    for item in found:
+        try:
+            values.append(float(item.replace(",", "")))
+        except ValueError:
+            continue
+    return values
+
+
+def is_valid(data):
+    """Check that the LLM response has the required fields and types."""
+    if not isinstance(data, dict):
+        return False
+    amount = data.get("amount")
+    if amount is not None and (isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount < 0):
+        return False
+    if data.get("category") not in ALLOWED_CATEGORIES:
+        return False
+    if not isinstance(data.get("bill"), bool):
+        return False
+    if not isinstance(data.get("summary"), str) or len(data["summary"].split()) > 10:
+        return False
+    return True
+
+
+def check_facts(note, data):
+    """Do not trust the model for amount or bill: verify both against the original note."""
+    note_numbers = numbers_in(note)
+    amount = data.get("amount")
+    if amount is not None and not any(abs(float(amount) - n) < 0.001 for n in note_numbers):
+        data["amount"] = None
+
+    lower = note.lower()
+    mentions_bill = any(word in lower for word in ("bill", "receipt", "invoice", "ticket"))
+    says_missing = any(phrase in lower for phrase in (
+        "no bill", "bill missing", "bill not attached", "without bill",
+        "receipt missing", "no receipt", "will attach later", "coming later"
+    ))
+    data["bill"] = bool(mentions_bill and not says_missing and data.get("bill") is True)
+    return data
+
+
+def load_system_prompt():
+    return SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+
+
+def classify(note):
+    """Call an OpenAI-compatible chat-completions endpoint and parse JSON."""
+    load_env_file()
+    api_key = os.getenv("LLM_API_KEY")
+    api_url = os.getenv("LLM_API_URL")
+    model = os.getenv("LLM_MODEL")
+    if not all((api_key, api_url, model)):
+        raise RuntimeError("Set LLM_API_KEY, LLM_API_URL and LLM_MODEL in your .env file.")
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": load_system_prompt()},
+            {"role": "user", "content": "Extract the required JSON for this claim note:\n" + note}
+        ]
+    }
+    request = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+        content = response_data["choices"][0]["message"]["content"]
+        # Support models that wrap JSON in Markdown fences.
+        content = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip(), flags=re.I)
+        parsed = json.loads(content)
+        if not is_valid(parsed):
+            raise ValueError("LLM response did not match the required JSON schema.")
+        return check_facts(note, parsed)
+    except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Could not get a valid LLM result: {exc}") from exc
+
+
+def decide(claim, data, running_totals, budgets, group_amount):
+    """Apply the project rules in the exact order specified."""
+    amount = data.get("amount")
+    if amount is None:
+        return "needs_more_info", "No clear amount in the claim"
+    if not data.get("bill"):
+        return "needs_bill", "Bill or receipt is missing"
+    if amount > 5000 or group_amount > 5000:
+        return "needs_approval", "Amount or same-day grouped claims exceed Rs. 5,000"
+
+    club = claim["club"]
+    category = data["category"]
+    limit = budgets.get(category)
+    current = running_totals[(club, category)]
+    if limit is not None and current + amount > limit:
+        return "over_budget", f"{category} budget limit would be exceeded"
+    return "ok_to_pay", "All checks passed"
+
+
+def read_csv(path):
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def write_csv(path, rows, fieldnames):
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_reports(results, payable, review, spending, budgets, status_counts):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    fields = ["id", "club", "date", "amount", "category", "bill", "summary", "status", "reason", "note"]
+    write_csv(OUTPUT_DIR / "payable.csv", payable, fields)
+    write_csv(OUTPUT_DIR / "review.csv", review, fields)
+    write_csv(OUTPUT_DIR / "results.csv", results, fields)
+
+    lines = ["CLUB EXPENSE CLAIM CHECKER - SUMMARY", "", "Status counts:"]
+    for status in sorted(STATUSES):
+        lines.append(f"{status}: {status_counts[status]}")
+    lines += ["", "Club spending against category limits (only OK claims count):"]
+    clubs = sorted({club for club, _ in spending})
+    for club in clubs:
+        lines.append(f"\n{club}")
+        for category, limit in sorted(budgets.items()):
+            used = spending[(club, category)]
+            lines.append(f"  {category}: Rs. {used:,.2f} / Rs. {limit:,.2f}")
+    (OUTPUT_DIR / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run():
+    claims = read_csv(CLAIMS_FILE)
+    budget_rows = read_csv(BUDGETS_FILE)
+    budgets = {row["category"].strip(): float(row["limit_per_club"]) for row in budget_rows}
+    # First extract all claims so same club/category/date split claims can be detected.
+    extracted = []
+    for claim in claims:
+        data = classify(claim["note"])
+        key = (claim["club"], data["category"], claim["date"])
+        extracted.append((claim, data, key))
+
+    grouped = defaultdict(float)
+    for claim, data, key in extracted:
+        if data["amount"] is not None:
+            grouped[key] += data["amount"]
+
+    running_totals = defaultdict(float)
+    spending = defaultdict(float)
+    status_counts = defaultdict(int)
+    results, payable, review = [], [], []
+
+    for claim, data, key in extracted:
+        group_amount = grouped[key]
+        status, reason = decide(claim, data, running_totals, budgets, group_amount)
+        if status == "ok_to_pay":
+            running_totals[(claim["club"], data["category"])] += data["amount"]
+            spending[(claim["club"], data["category"])] += data["amount"]
+        status_counts[status] += 1
+        row = {
+            "id": claim["id"], "club": claim["club"], "date": claim["date"],
+            "amount": "" if data["amount"] is None else data["amount"],
+            "category": data["category"], "bill": data["bill"],
+            "summary": data["summary"], "status": status, "reason": reason,
+            "note": claim["note"]
+        }
+        results.append(row)
+        (payable if status == "ok_to_pay" else review).append(row)
+
+    write_reports(results, payable, review, spending, budgets, status_counts)
+    print(f"Processed {len(claims)} claims.")
+    print(f"Reports saved in: {OUTPUT_DIR}")
+    print("This tool only classifies claims. It does not authorize or make payments.")
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

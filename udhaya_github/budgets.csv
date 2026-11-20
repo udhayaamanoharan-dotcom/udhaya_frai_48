@@ -1,0 +1,5 @@
+# Copy this file to .env and fill in values from your approved Week 12 LLM provider.
+# Never commit .env or paste your API key into main.py.
+LLM_API_URL=https://YOUR_PROVIDER_ENDPOINT/v1/chat/completions
+LLM_MODEL=YOUR_MODEL_NAME
+LLM_API_KEY=PASTE_YOUR_SECRET_KEY_HERE
